@@ -31,6 +31,8 @@ MARKET_START = dtime(
 MARKET_END = dtime(15, 20)
 EXPECTED_UNIVERSE_SIZE = int(os.getenv("MONEY_FLOW_TOP_N", "50"))
 
+# FUTURES AGGRESSION COLLECTOR v2.1 — adds consecutive futures-state persistence
+
 if not TOKEN:
     raise RuntimeError("UPSTOX_TOKEN is missing")
 if not DATABASE_URL:
@@ -82,6 +84,11 @@ def ensure_table():
         oi_change_t0_pct NUMERIC,
 
         aggression_state TEXT,
+        state_persistence INTEGER NOT NULL DEFAULT 0,
+        long_build_persistence INTEGER NOT NULL DEFAULT 0,
+        short_build_persistence INTEGER NOT NULL DEFAULT 0,
+        short_cover_persistence INTEGER NOT NULL DEFAULT 0,
+        long_unwind_persistence INTEGER NOT NULL DEFAULT 0,
         tick_count INTEGER NOT NULL DEFAULT 0,
         classified_trade_count INTEGER NOT NULL DEFAULT 0,
 
@@ -119,6 +126,16 @@ def ensure_table():
         ADD COLUMN IF NOT EXISTS price_change_t0_pct NUMERIC;
     ALTER TABLE public.futures_aggression_snapshots
         ADD COLUMN IF NOT EXISTS oi_change_t0_pct NUMERIC;
+    ALTER TABLE public.futures_aggression_snapshots
+        ADD COLUMN IF NOT EXISTS state_persistence INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.futures_aggression_snapshots
+        ADD COLUMN IF NOT EXISTS long_build_persistence INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.futures_aggression_snapshots
+        ADD COLUMN IF NOT EXISTS short_build_persistence INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.futures_aggression_snapshots
+        ADD COLUMN IF NOT EXISTS short_cover_persistence INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.futures_aggression_snapshots
+        ADD COLUMN IF NOT EXISTS long_unwind_persistence INTEGER NOT NULL DEFAULT 0;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -272,6 +289,8 @@ class AggressionCollector:
         self.last_tick = {}
         self.bucket = {}
         self.previous_flush = {}
+        self.previous_state = {}
+        self.state_streak = {}
         self.minute_bars = {}
         self.last_vtt_1m = {}
 
@@ -490,6 +509,24 @@ class AggressionCollector:
                     elif price_change < 0 and oi_change_pct < 0:
                         state = "LONG UNWINDING"
 
+                # Consecutive 3-minute futures-state persistence.
+                # The streak resets immediately when the structural state changes.
+                prior_state = self.previous_state.get(key)
+                if state != "NEUTRAL" and state == prior_state:
+                    state_persistence = self.state_streak.get(key, 0) + 1
+                elif state != "NEUTRAL":
+                    state_persistence = 1
+                else:
+                    state_persistence = 0
+
+                self.previous_state[key] = state
+                self.state_streak[key] = state_persistence
+
+                long_build_persistence = state_persistence if state == "NEW LONG BUILD" else 0
+                short_build_persistence = state_persistence if state == "NEW SHORT BUILD" else 0
+                short_cover_persistence = state_persistence if state == "SHORT COVERING" else 0
+                long_unwind_persistence = state_persistence if state == "LONG UNWINDING" else 0
+
                 rows.append((
                     now.date(), now, meta["rank"], meta["symbol"], key,
                     t["ltp"], t["ltt"], t["ltq"], t["vtt"], t["oi"],
@@ -500,7 +537,10 @@ class AggressionCollector:
                     buy, sell, b["unclassified_trade_qty"], delta, delta_pct,
                     price_change, oi_change, oi_change_pct,
                     price_change_t0_pct, oi_change_t0_pct,
-                    state, b["tick_count"], b["classified_trade_count"]
+                    state, state_persistence,
+                    long_build_persistence, short_build_persistence,
+                    short_cover_persistence, long_unwind_persistence,
+                    b["tick_count"], b["classified_trade_count"]
                 ))
 
                 self.previous_flush[key] = dict(t)
@@ -520,7 +560,10 @@ class AggressionCollector:
             trade_delta, delta_pct,
             price_change_3m_pct, oi_change_3m, oi_change_3m_pct,
             price_change_t0_pct, oi_change_t0_pct,
-            aggression_state, tick_count, classified_trade_count
+            aggression_state, state_persistence,
+            long_build_persistence, short_build_persistence,
+            short_cover_persistence, long_unwind_persistence,
+            tick_count, classified_trade_count
         ) VALUES (
             %s,%s,%s,%s,%s,
             %s,%s,%s,%s,%s,
@@ -531,7 +574,7 @@ class AggressionCollector:
             %s,%s,
             %s,%s,%s,
             %s,%s,
-            %s,%s,%s
+            %s,%s,%s,%s,%s,%s,%s,%s
         )
         ON CONFLICT (trading_date, ts, symbol) DO UPDATE SET
             ltp = EXCLUDED.ltp,
@@ -560,6 +603,11 @@ class AggressionCollector:
             price_change_t0_pct = EXCLUDED.price_change_t0_pct,
             oi_change_t0_pct = EXCLUDED.oi_change_t0_pct,
             aggression_state = EXCLUDED.aggression_state,
+            state_persistence = EXCLUDED.state_persistence,
+            long_build_persistence = EXCLUDED.long_build_persistence,
+            short_build_persistence = EXCLUDED.short_build_persistence,
+            short_cover_persistence = EXCLUDED.short_cover_persistence,
+            long_unwind_persistence = EXCLUDED.long_unwind_persistence,
             tick_count = EXCLUDED.tick_count,
             classified_trade_count = EXCLUDED.classified_trade_count;
         """
@@ -568,7 +616,15 @@ class AggressionCollector:
                 cur.executemany(sql, rows)
             conn.commit()
 
+        persistent = [
+            (r[3], r[30], r[31])
+            for r in rows
+            if r[31] >= 2
+        ]
         log(f"Wrote {len(rows)} futures aggression rows.")
+        if persistent:
+            summary = ", ".join(f"{sym}:{state} x{streak}" for sym, state, streak in persistent[:12])
+            log(f"PERSISTENT FUTURES STATES | {summary}")
 
 def wait_for_universe():
     last_notice = None
